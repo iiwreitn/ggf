@@ -19,6 +19,7 @@ from fastapi import (
     status,
     Query,
 )
+from fastapi.params import Form as FormParam
 
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +51,7 @@ from open_webui.storage.provider import Storage
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STORAGE_LOCAL_CACHE, STORAGE_PROVIDER, UPLOAD_DIR
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.misc import calculate_sha256_bytes
 from open_webui.utils.misc import strict_match_mime_type
 from pydantic import BaseModel
 
@@ -215,15 +217,22 @@ async def upload_file_handler(
 ):
     log.info(f'file.content_type: {file.content_type} {process}')
 
-    if isinstance(metadata, str):
+    # Handle metadata: when called directly (not via HTTP), Form(None) remains a Form object
+    # When called via HTTP, FastAPI resolves it to None or the actual value
+    if metadata is None or isinstance(metadata, FormParam):
+        file_metadata = {}
+    elif isinstance(metadata, str):
         try:
-            metadata = json.loads(metadata)
+            file_metadata = json.loads(metadata)
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT('Invalid metadata format'),
             )
-    file_metadata = metadata if metadata else {}
+    elif isinstance(metadata, dict):
+        file_metadata = metadata
+    else:
+        file_metadata = {}
 
     try:
         unsanitized_filename = file.filename
@@ -260,6 +269,9 @@ async def upload_file_handler(
             },
         )
 
+        # Calculate SHA-256 hash of the raw file bytes for sync comparison
+        file_hash = calculate_sha256_bytes(contents)
+
         file_item = await Files.insert_new_file(
             user.id,
             FileForm(
@@ -274,6 +286,9 @@ async def upload_file_handler(
                         'name': name,
                         'content_type': (file.content_type if isinstance(file.content_type, str) else None),
                         'size': len(contents),
+                        'file_hash': file_hash,
+                        # Store original path for directory sync (includes subdirectories)
+                        'original_path': unsanitized_filename,
                         'data': file_metadata,
                     },
                 }

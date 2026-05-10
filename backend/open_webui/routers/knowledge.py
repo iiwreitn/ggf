@@ -1,6 +1,6 @@
 from typing import List, Optional
-from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 
 import logging
@@ -27,6 +27,7 @@ from open_webui.routers.retrieval import (
     BatchProcessFilesForm,
 )
 from open_webui.storage.provider import Storage
+from open_webui.routers.files import upload_file_handler, delete_file_by_id as delete_file_by_id_route
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
@@ -686,6 +687,215 @@ async def add_file_to_knowledge_by_id(
         )
 
 
+############################
+# UploadAndReplaceFile
+############################
+
+
+class UploadAndReplaceResponse(BaseModel):
+    """Response from upload_and_replace endpoint."""
+
+    new_file_id: str
+    old_file_id: str
+    filename: str
+
+
+async def _rollback_new_file(
+    kb_id: str,
+    new_file_id: str,
+    user,
+    db: AsyncSession,
+) -> None:
+    # Compensating cleanup after a failed replace: the new file was already
+    # added to the KB with embeddings, so purge KB vectors and then hand
+    # off to the router delete to remove storage, file row, and the per-
+    # file vector collection. Each step is best-effort — if rollback itself
+    # errors we log and move on, since we're already in a failure path.
+    try:
+        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=kb_id, filter={'file_id': new_file_id})
+    except Exception as vector_err:
+        log.warning(
+            f'Rollback: failed to purge KB embeddings for {new_file_id}: {vector_err}'
+        )
+    try:
+        await delete_file_by_id_route(id=new_file_id, user=user, db=db)
+    except Exception as cleanup_err:
+        log.warning(
+            f'Rollback: failed to delete new file {new_file_id}: {cleanup_err}'
+        )
+
+
+@router.post('/{id}/file/upload_and_replace', response_model=UploadAndReplaceResponse)
+async def upload_and_replace_file(
+    request: Request,
+    id: str,
+    file: UploadFile = File(...),
+    old_file_id: str = Form(...),
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """
+    Atomically upload a new file and replace an existing file in the knowledge base.
+    """
+    # Validate knowledge base exists and user has access
+    knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
+    if not knowledge:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if (
+        knowledge.user_id != user.id
+        and not await AccessGrants.has_access(
+            user_id=user.id,
+            resource_type='knowledge',
+            resource_id=knowledge.id,
+            permission='write',
+            db=db,
+        )
+        and user.role != 'admin'
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    # Validate old file exists AND belongs to this knowledge base.
+    # Checking only global existence would let callers "replace" a file from
+    # another KB (or no KB) — the new file gets added here while the old one
+    # is untouched or removed from the wrong collection.
+    old_file = await Files.get_file_by_id(old_file_id, db=db)
+    if not old_file or not await Knowledges.has_file(
+        knowledge_id=id, file_id=old_file_id, db=db
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # Step 1: Upload the new file (reuses existing upload_file_handler)
+    try:
+        new_file_result = await upload_file_handler(
+            request,
+            file=file,
+            process=True,
+            process_in_background=False,
+            user=user,
+            db=db,
+        )
+        new_file_id = new_file_result['id']
+    except HTTPException:
+        # Preserve upstream status/detail (e.g. 413 payload-too-large or
+        # validation-specific 400 messages) instead of flattening everything
+        # to a generic 400 with str(exc).
+        raise
+    except Exception as e:
+        log.exception(f'Failed to upload new file: {e}')
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Failed to upload file: {str(e)}',
+        )
+
+    # Step 2: Verify new file was processed. Data can hold content and a
+    # status of 'pending', 'failed', or 'completed' — only 'completed' means
+    # embeddings succeeded. The previous `not new_file.data` check let failed
+    # or still-pending files slip through.
+    new_file = await Files.get_file_by_id(new_file_id, db=db)
+    if not new_file or not new_file.data or new_file.data.get('status') != 'completed':
+        error_detail = (new_file.data or {}).get('error') if new_file else None
+        # Clean up the newly uploaded artifact so failed replacements don't
+        # accumulate orphaned file rows and storage blobs over repeated syncs.
+        try:
+            await delete_file_by_id_route(id=new_file_id, user=user, db=db)
+        except Exception as cleanup_err:
+            log.warning(f'Failed to clean up new file {new_file_id} after processing failure: {cleanup_err}')
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_detail or ERROR_MESSAGES.FILE_NOT_PROCESSED,
+        )
+
+    # Step 3: Add new file to knowledge base (reuses existing process_file)
+    try:
+        await process_file(
+            request,
+            ProcessFileForm(file_id=new_file_id, collection_name=id),
+            user=user,
+            db=db,
+        )
+        await Knowledges.add_file_to_knowledge_by_id(
+            knowledge_id=id, file_id=new_file_id, user_id=user.id, db=db
+        )
+    except Exception as e:
+        log.error(f'Failed to add new file to knowledge base: {e}')
+        # process_file may have already written embeddings into the KB
+        # collection before add_file_to_knowledge_by_id failed. The router
+        # delete iterates KB associations to clean KB vectors, so without
+        # the association those chunks would stay discoverable by retrieval
+        # even after the file record is gone. Purge them by file_id here
+        # before handing off to the full delete.
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(
+                collection_name=id, filter={'file_id': new_file_id}
+            )
+        except Exception as vector_err:
+            log.warning(
+                f'Failed to purge orphan KB embeddings for {new_file_id}: {vector_err}'
+            )
+
+        # Clean up via the router-level delete so storage object and vector
+        # collection are removed too — Files.delete_file_by_id only drops the
+        # DB row and would orphan S3/GCS objects and the per-file vector
+        # collection.
+        try:
+            await delete_file_by_id_route(id=new_file_id, user=user, db=db)
+        except Exception as cleanup_err:
+            log.warning(f'Failed to clean up new file {new_file_id} after KB add failure: {cleanup_err}')
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Failed to add file to knowledge base: {str(e)}',
+        )
+
+    # Step 4: Remove old file via the KB-scoped helper. That route now
+    # hard-deletes the file row, storage blob, and per-file vector collection
+    # only when no other knowledge base still references the old file —
+    # otherwise it degrades to a scoped unlink so replace-in-KB-A doesn't
+    # silently wipe the same file from KB-B.
+    # If this fails we've already added the new file to the KB, which would
+    # leave duplicated KB entries and violate "replace" semantics. Roll back
+    # the new file (unlink + storage + vectors) as a best-effort
+    # compensation so the KB is left in its pre-replace state and the
+    # caller can retry cleanly.
+    try:
+        await remove_file_from_knowledge_by_id(
+            id=id,
+            form_data=KnowledgeFileIdForm(file_id=old_file_id),
+            delete_file=True,
+            user=user,
+            db=db,
+        )
+    except HTTPException:
+        await _rollback_new_file(
+            kb_id=id, new_file_id=new_file_id, user=user, db=db
+        )
+        raise
+    except Exception as e:
+        log.error(f'Failed to remove old file after replacement upload: {e}')
+        await _rollback_new_file(
+            kb_id=id, new_file_id=new_file_id, user=user, db=db
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Replacement rolled back: failed to remove old file ({str(e)})',
+        )
+
+    return UploadAndReplaceResponse(
+        new_file_id=new_file_id,
+        old_file_id=old_file_id,
+        filename=new_file.filename,
+    )
+
+
 @router.post('/{id}/file/update', response_model=Optional[KnowledgeFilesResponse])
 async def update_file_from_knowledge_by_id(
     request: Request,
@@ -831,18 +1041,52 @@ async def remove_file_from_knowledge_by_id(
     # knowledge base but must not be able to destroy files they do not own,
     # as the same file may be referenced by other KBs and chats.
     if delete_file and (file.user_id == user.id or user.role == 'admin'):
-        try:
-            # Remove the file's collection from vector database
-            file_collection = f'file-{form_data.file_id}'
-            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
-                await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
-        except Exception as e:
-            log.debug('This was most likely caused by bypassing embedding processing')
-            log.debug(e)
-            pass
+        # Only hard-delete the file record, storage blob, and per-file vector
+        # collection if no other knowledge base still references this file.
+        # Otherwise the request becomes a KB-scoped unlink so callers (e.g.
+        # the directory-sync remove loop) can't silently wipe a file that is
+        # shared with another KB.
+        remaining_kbs = await Knowledges.get_knowledges_by_file_id(
+            form_data.file_id, db=db
+        )
+        if not remaining_kbs:
+            try:
+                # Remove the file's collection from vector database
+                file_collection = f'file-{form_data.file_id}'
+                if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
+                    await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
+            except Exception as e:
+                log.debug('This was most likely caused by bypassing embedding processing')
+                log.debug(e)
+                pass
 
-        # Delete file from database
-        await Files.delete_file_by_id(form_data.file_id, db=db)
+            # Delete the object-storage blob before dropping the DB row so we
+            # still have file.path available. If storage deletion fails we
+            # must NOT drop the DB row: a transient S3/GCS failure would
+            # otherwise leave an orphan blob with no metadata to retry
+            # against. Keeping the file row lets an operator re-issue the
+            # delete once the backend recovers.
+            try:
+                Storage.delete_file(file.path)
+            except Exception as storage_err:
+                log.exception(
+                    f'Failed to delete storage blob for {form_data.file_id}: {storage_err}'
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        'File unlinked from knowledge base, but deleting the '
+                        'stored blob failed; file record kept for retry.'
+                    ),
+                )
+
+            # Delete file from database
+            await Files.delete_file_by_id(form_data.file_id, db=db)
+        else:
+            log.info(
+                f'File {form_data.file_id} still referenced by {len(remaining_kbs)} '
+                f'other knowledge base(s); skipping hard-delete.'
+            )
 
     if knowledge:
         return KnowledgeFilesResponse(
@@ -962,6 +1206,225 @@ async def reset_knowledge_by_id(
 
     knowledge = await Knowledges.reset_knowledge_by_id(id=id, db=db)
     return knowledge
+
+
+############################
+# SyncCompare
+############################
+
+
+class FileSyncCompareItem(BaseModel):
+    """Item for comparing a file during sync."""
+
+    # Relative path within the directory (e.g., "docs/readme.md"). Must be
+    # non-empty, bounded to reject pathologically long payloads, and may not
+    # contain NUL bytes or traversal segments — the backend stores this as
+    # meta.original_path and later matches incoming paths against it.
+    file_path: str = Field(..., min_length=1, max_length=4096)
+    # Empty string is an explicit signal from the client that hashing was
+    # skipped (e.g. file over the browser-side threshold) — the compare
+    # logic then falls back to size comparison. A non-empty hash must be a
+    # lowercase 64-char hex SHA-256 digest.
+    file_hash: str = Field(..., max_length=64)
+    size: int = Field(..., ge=0)
+
+    @field_validator('file_path')
+    @classmethod
+    def _validate_file_path(cls, value: str) -> str:
+        if '\x00' in value:
+            raise ValueError('file_path must not contain NUL bytes')
+        # Reject paths that are effectively blank (empty or whitespace-only)
+        # without mutating the input: this endpoint is a path-identity
+        # protocol and some filesystems (notably Linux) treat leading or
+        # trailing whitespace as significant. Stripping the value would
+        # collapse " report.txt" and "report.txt" to the same key and the
+        # response path would no longer match the client's directoryFiles
+        # lookup.
+        if not value.strip():
+            raise ValueError('file_path must not be blank')
+        parts = value.replace('\\', '/').split('/')
+        if any(part == '..' for part in parts):
+            raise ValueError('file_path must not contain traversal segments')
+        return value
+
+    @field_validator('file_hash')
+    @classmethod
+    def _validate_file_hash(cls, value: str) -> str:
+        if value == '':
+            return value
+        if len(value) != 64 or any(ch not in '0123456789abcdef' for ch in value):
+            raise ValueError('file_hash must be a lowercase 64-char hex SHA-256 digest or empty')
+        return value
+
+
+class SyncCompareForm(BaseModel):
+    """Form for comparing files for sync."""
+
+    files: List[FileSyncCompareItem]
+
+
+class ChangedFileInfo(BaseModel):
+    """Info about a changed file that needs to be replaced."""
+
+    file_path: str  # Path of the new file to upload
+    old_file_id: str  # ID of the old file to delete after upload
+
+
+class SyncCompareResponse(BaseModel):
+    """Response from sync compare endpoint."""
+
+    new_files: List[str]  # file_paths for new files (no old version exists)
+    changed_files: List[ChangedFileInfo]  # files that changed (upload new, delete old)
+    removed_file_ids: List[str]  # file_ids to remove (no new version exists)
+    unchanged: List[str]  # file_paths that are already up to date
+
+
+
+
+@router.post('/{id}/sync/compare', response_model=SyncCompareResponse)
+async def compare_files_for_sync(
+    id: str,
+    form_data: SyncCompareForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """
+    Compare uploaded files against existing knowledge base files.
+    Returns lists of files that need to be uploaded, deleted, or are unchanged.
+    """
+    knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
+    if not knowledge:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if (
+        knowledge.user_id != user.id
+        and not await AccessGrants.has_access(
+            user_id=user.id,
+            resource_type='knowledge',
+            resource_id=knowledge.id,
+            permission='write',
+            db=db,
+        )
+        and user.role != 'admin'
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    # Reject payloads with duplicate file_path entries. A duplicate would plan
+    # the same existing file for replacement or removal twice, producing
+    # downstream 404s on the second pass and muddying the success/failure
+    # counts on the client. Public API robustness shouldn't depend on the
+    # frontend deduping. Collect duplicates in a single pass (Counter is O(n))
+    # — iterating list.count per entry is O(n^2) and becomes a hotspot for
+    # large directory syncs.
+    from collections import Counter
+
+    path_counts = Counter(incoming.file_path for incoming in form_data.files)
+    duplicates = sorted(path for path, count in path_counts.items() if count > 1)
+    if duplicates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Duplicate file_path entries in sync payload: {", ".join(duplicates)}',
+        )
+
+    # Get all files currently in the knowledge base
+    existing_files = await Knowledges.get_files_by_id(id, db=db)
+
+    # Build a map of existing files by their sync path for quick lookup.
+    # Priority: original_path (for directory sync) > name > filename.
+    # Multiple KB files can resolve to the same sync path (repeated uploads
+    # of the same filename), so collect them in a list instead of letting
+    # later entries silently overwrite earlier ones.
+    existing_by_path: dict[str, List[FileModel]] = {}
+    for file in existing_files:
+        if file.meta:
+            sync_path = file.meta.get('original_path') or file.meta.get('name', file.filename)
+        else:
+            sync_path = file.filename
+        existing_by_path.setdefault(sync_path, []).append(file)
+
+    # Track files from the incoming directory
+    incoming_filenames = set()
+    new_files: List[str] = []  # New files (no old version)
+    changed_files: List[ChangedFileInfo] = []  # Changed files (need upload + delete old)
+    removed_file_ids: List[str] = []  # Removed files (no new version)
+    unchanged: List[str] = []
+
+    for incoming_file in form_data.files:
+        incoming_filenames.add(incoming_file.file_path)
+
+        # Look up all KB files that share this sync path. Use the first as the
+        # canonical target for compare/replace and schedule any remaining
+        # duplicates for removal so sync converges to a single file per path.
+        existing_entries = existing_by_path.get(incoming_file.file_path)
+        existing_file = existing_entries[0] if existing_entries else None
+        if existing_entries and len(existing_entries) > 1:
+            for duplicate in existing_entries[1:]:
+                removed_file_ids.append(duplicate.id)
+
+        if existing_file:
+            # Check if hash is already stored in meta (files uploaded after this feature)
+            stored_hash = existing_file.meta.get('file_hash') if existing_file.meta else None
+
+            if stored_hash and incoming_file.file_hash:
+                # Modern file with stored hash AND client supplied a hash -
+                # use accurate hash comparison. Empty incoming hash falls
+                # through to the size-based fallback so the browser can skip
+                # hashing large files without every such file being flagged
+                # as changed.
+                if stored_hash == incoming_file.file_hash:
+                    # File unchanged
+                    unchanged.append(incoming_file.file_path)
+                else:
+                    # File changed - need to upload new and delete old
+                    changed_files.append(
+                        ChangedFileInfo(
+                            file_path=incoming_file.file_path,
+                            old_file_id=existing_file.id,
+                        )
+                    )
+            else:
+                # Legacy file without stored hash - use size comparison as fast fallback
+                # This avoids expensive I/O (downloading from S3 + hashing) during compare
+                # Trade-off: If content changed but size is same, we won't detect it
+                # But this is rare, and when files ARE re-uploaded, they get hashes stored
+                existing_size = existing_file.meta.get('size') if existing_file.meta else None
+
+                if existing_size is not None and existing_size == incoming_file.size:
+                    # Size matches - assume unchanged (conservative for legacy files)
+                    unchanged.append(incoming_file.file_path)
+                else:
+                    # Size differs or unknown - treat as changed
+                    changed_files.append(
+                        ChangedFileInfo(
+                            file_path=incoming_file.file_path,
+                            old_file_id=existing_file.id,
+                        )
+                    )
+        else:
+            # New file - needs to be uploaded
+            new_files.append(incoming_file.file_path)
+
+    # Find files to delete (exist in KB but not in incoming directory).
+    # Include every duplicate so nothing is silently retained.
+    for sync_path, files in existing_by_path.items():
+        if sync_path not in incoming_filenames:
+            for file in files:
+                removed_file_ids.append(file.id)
+
+
+
+    return SyncCompareResponse(
+        new_files=new_files,
+        changed_files=changed_files,
+        removed_file_ids=removed_file_ids,
+        unchanged=unchanged,
+    )
 
 
 ############################

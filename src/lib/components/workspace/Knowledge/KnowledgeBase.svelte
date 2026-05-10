@@ -32,7 +32,10 @@
 		updateFileFromKnowledgeById,
 		updateKnowledgeById,
 		updateKnowledgeAccessGrants,
-		searchKnowledgeFilesById
+		searchKnowledgeFilesById,
+		compareFilesForSync,
+		uploadAndReplaceFile,
+		type FileSyncCompareItem
 	} from '$lib/apis/knowledge';
 	import { processWeb, processYoutubeVideo } from '$lib/apis/retrieval';
 
@@ -261,7 +264,12 @@
 		}
 	};
 
-	const uploadFileHandler = async (file) => {
+	// Returns true only if the file was uploaded AND added to the KB without
+	// any error surfaced. Callers (notably the directory sync flow) rely on
+	// this boolean to distinguish genuine successes from empty-file / size-
+	// limit / upload / add failures that this handler otherwise swallows via
+	// toasts.
+	const uploadFileHandler = async (file): Promise<boolean> => {
 		console.log(file);
 
 		const fileItem = {
@@ -278,7 +286,7 @@
 
 		if (fileItem.size == 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
-			return null;
+			return false;
 		}
 
 		if (
@@ -294,7 +302,7 @@
 					maxSize: $config?.file?.max_size
 				})
 			);
-			return;
+			return false;
 		}
 
 		fileItems = [fileItem, ...(fileItems ?? [])];
@@ -328,32 +336,55 @@
 					console.warn('File upload warning:', uploadedFile.error);
 					toast.warning(uploadedFile.error);
 					fileItems = fileItems.filter((file) => file.id !== uploadedFile.id);
+					return false;
 				} else {
-					await addFileHandler(uploadedFile.id);
+					const added = await addFileHandler(uploadedFile.id);
+					return Boolean(added);
 				}
 			} else {
 				toast.error($i18n.t('Failed to upload file.'));
+				return false;
 			}
 		} catch (e) {
 			toast.error(`${e}`);
+			return false;
 		}
 	};
 
+	// Upload directory handler - uses shared utility
 	const uploadDirectoryHandler = async () => {
-		// Check if File System Access API is supported
-		const isFileSystemAccessSupported = 'showDirectoryPicker' in window;
-
-		try {
-			if (isFileSystemAccessSupported) {
-				// Modern browsers (Chrome, Edge) implementation
-				await handleModernBrowserUpload();
-			} else {
-				// Firefox fallback
-				await handleFirefoxUpload();
-			}
-		} catch (error) {
-			handleUploadError(error);
-		}
+	    try {
+	        const files = await collectDirectoryFiles();
+	
+	        if (files.length === 0) {
+	            toast.info($i18n.t('No files found in directory'));
+	            return;
+	        }
+	
+	        const totalFiles = files.length;
+	        let uploadedFiles = 0;
+	
+	        const updateProgress = () => {
+	            const percentage = (uploadedFiles / totalFiles) * 100;
+	            toast.info(
+	                $i18n.t('Upload Progress: {{uploadedFiles}}/{{totalFiles}} ({{percentage}}%)', {
+	                    uploadedFiles,
+	                    totalFiles,
+	                    percentage: percentage.toFixed(2)
+	                })
+	            );
+	        };
+	
+	        updateProgress();
+	
+	        for (const { file } of files) {
+	            await uploadFileHandler(file);
+	            uploadedFiles++;
+	            updateProgress();
+	        }
+	    } catch (error) {
+	        handleUploadError(error);
+	    }
 	};
 
 	// Helper function to check if a path contains hidden folders
@@ -361,144 +392,180 @@
 		return path.split('/').some((part) => part.startsWith('.'));
 	};
 
-	// Modern browsers implementation using File System Access API
-	const handleModernBrowserUpload = async () => {
-		const dirHandle = await window.showDirectoryPicker();
-		let totalFiles = 0;
-		let uploadedFiles = 0;
+	// SubtleCrypto.digest has no streaming API, so hashing requires loading
+	// the full file into an ArrayBuffer. For very large files that can freeze
+	// or crash the tab. Skip hashing above this threshold and let the
+	// backend fall back to size-based comparison (already supported for
+	// legacy files without a stored hash).
+	const MAX_BROWSER_HASH_BYTES = 100 * 1024 * 1024; // 100 MB
 
-		// Function to update the UI with the progress
-		const updateProgress = () => {
-			const percentage = (uploadedFiles / totalFiles) * 100;
-			toast.info(
-				$i18n.t('Upload Progress: {{uploadedFiles}}/{{totalFiles}} ({{percentage}}%)', {
-					uploadedFiles: uploadedFiles,
-					totalFiles: totalFiles,
-					percentage: percentage.toFixed(2)
-				})
-			);
-		};
-
-		// Recursive function to count all files excluding hidden ones
-		async function countFiles(dirHandle) {
-			for await (const entry of dirHandle.values()) {
-				// Skip hidden files and directories
-				if (entry.name.startsWith('.')) continue;
-
-				if (entry.kind === 'file') {
-					totalFiles++;
-				} else if (entry.kind === 'directory') {
-					// Only process non-hidden directories
-					if (!entry.name.startsWith('.')) {
-						await countFiles(entry);
-					}
-				}
-			}
+	// Calculate SHA-256 hash of a file in the browser. Returns '' when the
+	// file exceeds the in-memory hashing threshold.
+	const calculateFileHash = async (file: File): Promise<string> => {
+		if (file.size > MAX_BROWSER_HASH_BYTES) {
+			return '';
 		}
-
-		// Recursive function to process directories excluding hidden files and folders
-		async function processDirectory(dirHandle, path = '') {
-			for await (const entry of dirHandle.values()) {
-				// Skip hidden files and directories
-				if (entry.name.startsWith('.')) continue;
-
-				const entryPath = path ? `${path}/${entry.name}` : entry.name;
-
-				// Skip if the path contains any hidden folders
-				if (hasHiddenFolder(entryPath)) continue;
-
-				if (entry.kind === 'file') {
-					const file = await entry.getFile();
-					const fileWithPath = new File([file], entryPath, { type: file.type });
-
-					await uploadFileHandler(fileWithPath);
-					uploadedFiles++;
-					updateProgress();
-				} else if (entry.kind === 'directory') {
-					// Only process non-hidden directories
-					if (!entry.name.startsWith('.')) {
-						await processDirectory(entry, entryPath);
-					}
-				}
-			}
-		}
-
-		await countFiles(dirHandle);
-		updateProgress();
-
-		if (totalFiles > 0) {
-			await processDirectory(dirHandle);
-		} else {
-			console.log('No files to upload.');
-		}
+		const buffer = await file.arrayBuffer();
+		const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+		return Array.from(new Uint8Array(hashBuffer))
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
 	};
+	
+	// Shared type for collected files
+	type CollectedFile = {
+	    file: File;
+	    path: string;
+	    size: number;
+	    hash?: string;
+	};
+	
+	// Shared utility to collect all files from a directory
+	const collectDirectoryFiles = async (options?: { withHashes?: boolean }): Promise<CollectedFile[]> => {
+	    const withHashes = options?.withHashes ?? false;
+	    const files: CollectedFile[] = [];
+	
+	    const isFileSystemAccessSupported = 'showDirectoryPicker' in window;
+	
+	    if (isFileSystemAccessSupported) {
+	        const dirHandle = await window.showDirectoryPicker();
+	
+	        async function processDirectory(dirHandle: FileSystemDirectoryHandle, path = '') {
+	            for await (const entry of dirHandle.values()) {
+	                if (entry.name.startsWith('.')) continue;
+	
+	                const entryPath = path ? `${path}/${entry.name}` : entry.name;
+	
+	                if (hasHiddenFolder(entryPath)) continue;
+	
+	                if (entry.kind === 'file') {
+	                    const file = await (entry as FileSystemFileHandle).getFile();
+	                    const fileWithPath = new File([file], entryPath, { type: file.type });
+	
+	                    const collectedFile: CollectedFile = {
+	                        file: fileWithPath,
+	                        path: entryPath,
+	                        size: file.size
+	                    };
+	
+	                    if (withHashes) {
+	                        collectedFile.hash = await calculateFileHash(file);
+	                    }
+	
+	                    files.push(collectedFile);
+	                } else if (entry.kind === 'directory') {
+	                    await processDirectory(entry as FileSystemDirectoryHandle, entryPath);
+	                }
+	            }
+	        }
+	
+	        await processDirectory(dirHandle);
+	    } else {
+	        // Firefox fallback
+	        await new Promise<void>((resolve, reject) => {
+	            const input = document.createElement('input');
+	            input.type = 'file';
+	            input.webkitdirectory = true;
+	            input.directory = true;
+	            input.multiple = true;
+	            input.style.display = 'none';
 
-	// Firefox fallback implementation using traditional file input
-	const handleFirefoxUpload = async () => {
-		return new Promise((resolve, reject) => {
-			// Create hidden file input
-			const input = document.createElement('input');
-			input.type = 'file';
-			input.webkitdirectory = true;
-			input.directory = true;
-			input.multiple = true;
-			input.style.display = 'none';
+	            document.body.appendChild(input);
 
-			// Add input to DOM temporarily
-			document.body.appendChild(input);
+	            // Cancelling the native file picker does not always fire
+	            // 'change' or 'error' — especially in Firefox, where the
+	            // picker can dismiss without any event, leaving the caller
+	            // stuck on "Scanning directory..." forever. Use 'cancel'
+	            // (modern browsers) plus a window-focus + delayed sentinel
+	            // fallback so the Promise ALWAYS settles: either we got
+	            // files, or we resolve with an empty list and the caller's
+	            // existing empty-check toasts.
+	            let settled = false;
+	            let changeStarted = false;
+	            let focusTimer: ReturnType<typeof setTimeout> | null = null;
+	            const finish = (err?: unknown) => {
+	                if (settled) return;
+	                settled = true;
+	                if (focusTimer !== null) {
+	                    clearTimeout(focusTimer);
+	                    focusTimer = null;
+	                }
+	                if (input.parentNode) {
+	                    input.parentNode.removeChild(input);
+	                }
+	                window.removeEventListener('focus', onFocus);
+	                if (err) {
+	                    reject(err);
+	                } else {
+	                    resolve();
+	                }
+	            };
+	            const onFocus = () => {
+	                // 'change' fires after 'focus' returns to the window, so
+	                // wait briefly before deciding the user cancelled. If a
+	                // change event actually started handling files before the
+	                // timer expires, changeStarted gates finish() so we don't
+	                // resolve in the middle of hashing a large batch with a
+	                // partial files array.
+	                focusTimer = setTimeout(() => {
+	                    focusTimer = null;
+	                    if (!changeStarted) {
+	                        finish();
+	                    }
+	                }, 500);
+	            };
 
-			input.onchange = async () => {
-				try {
-					const files = Array.from(input.files)
-						// Filter out files from hidden folders
-						.filter((file) => !hasHiddenFolder(file.webkitRelativePath));
+	            input.onchange = async () => {
+	                changeStarted = true;
+	                if (focusTimer !== null) {
+	                    clearTimeout(focusTimer);
+	                    focusTimer = null;
+	                }
+	                try {
+	                    const inputFiles = Array.from(input.files || []).filter(
+	                        (file) => !hasHiddenFolder(file.webkitRelativePath) && !file.name.startsWith('.')
+	                    );
 
-					let totalFiles = files.length;
-					let uploadedFiles = 0;
+	                    for (const file of inputFiles) {
+	                        const relativePath = file.webkitRelativePath || file.name;
+	                        const fileWithPath = new File([file], relativePath, { type: file.type });
 
-					// Function to update the UI with the progress
-					const updateProgress = () => {
-						const percentage = (uploadedFiles / totalFiles) * 100;
-						toast.info(
-							$i18n.t('Upload Progress: {{uploadedFiles}}/{{totalFiles}} ({{percentage}}%)', {
-								uploadedFiles: uploadedFiles,
-								totalFiles: totalFiles,
-								percentage: percentage.toFixed(2)
-							})
-						);
-					};
+	                        const collectedFile: CollectedFile = {
+	                            file: fileWithPath,
+	                            path: relativePath,
+	                            size: file.size
+	                        };
 
-					updateProgress();
+	                        if (withHashes) {
+	                            collectedFile.hash = await calculateFileHash(file);
+	                        }
 
-					// Process all files
-					for (const file of files) {
-						// Skip hidden files (additional check)
-						if (!file.name.startsWith('.')) {
-							const relativePath = file.webkitRelativePath || file.name;
-							const fileWithPath = new File([file], relativePath, { type: file.type });
+	                        files.push(collectedFile);
+	                    }
 
-							await uploadFileHandler(fileWithPath);
-							uploadedFiles++;
-							updateProgress();
-						}
-					}
+	                    finish();
+	                } catch (error) {
+	                    finish(error);
+	                }
+	            };
 
-					// Clean up
-					document.body.removeChild(input);
-					resolve();
-				} catch (error) {
-					reject(error);
-				}
-			};
+	            input.onerror = (error) => {
+	                finish(error);
+	            };
 
-			input.onerror = (error) => {
-				document.body.removeChild(input);
-				reject(error);
-			};
+	            // Newer browsers fire 'cancel' when the picker is dismissed
+	            // without a selection; cast because older lib.dom typings may
+	            // not yet declare it.
+	            (input as any).oncancel = () => {
+	                finish();
+	            };
 
-			// Trigger file picker
-			input.click();
-		});
+	            window.addEventListener('focus', onFocus, { once: true });
+	            input.click();
+	        });
+	    }
+	
+	    return files;
 	};
 
 	// Error handler
@@ -511,25 +578,267 @@
 		}
 	};
 
-	// Helper function to maintain file paths within zip
+	// Smart sync: only upload changed files, delete removed files
 	const syncDirectoryHandler = async () => {
-		if (fileItems.length > 0) {
-			const res = await resetKnowledgeById(localStorage.token, id).catch((e) => {
-				toast.error(`${e}`);
-			});
+	    // Collect files from the picker first. Errors here are directory/picker
+	    // issues (cancelled, permission denied) — route through handleUploadError.
+	    let directoryFiles;
+	    try {
+	        toast.info($i18n.t('Scanning directory...'));
+	        directoryFiles = await collectDirectoryFiles({ withHashes: true });
+	    } catch (error) {
+	        handleUploadError(error);
+	        return;
+	    }
 
-			if (res) {
-				fileItems = [];
-				toast.success($i18n.t('Knowledge reset successfully.'));
+	    if (directoryFiles.length === 0) {
+	        toast.info($i18n.t('No files found in directory'));
+	        return;
+	    }
 
-				// Upload directory
-				uploadDirectoryHandler();
-			}
-		} else {
-			uploadDirectoryHandler();
-		}
+	    // Warn about files that skipped hashing due to the in-memory hash
+	    // threshold. Those fall back to size-only comparison on the server,
+	    // so a content change that keeps the same byte size will NOT be
+	    // detected as changed. Surface this up front so the user can make
+	    // an informed decision (and knows which files to re-upload manually
+	    // if they suspect a silent-change case).
+	    const unhashed = directoryFiles.filter((f) => !f.hash);
+	    if (unhashed.length > 0) {
+	        console.warn(
+	            'Sync: files skipped browser hashing (size-only comparison will be used):',
+	            unhashed.map((f) => f.path)
+	        );
+	        toast.warning(
+	            $i18n.t(
+	                '{{count}} file(s) exceed the browser hash limit and will be compared by size only. Content changes that keep the same size will not be detected.',
+	                { count: unhashed.length }
+	            )
+	        );
+	    }
+
+	    // Everything below is API/business logic. Surface the server's detail
+	    // message so users can diagnose compare/upload/remove failures instead
+	    // of seeing a misleading "Error accessing directory" toast.
+	    try {
+	        toast.info(
+	            $i18n.t('Found {{count}} files, comparing with knowledge base...', {
+	                count: directoryFiles.length
+	            })
+	        );
+
+	        // Prepare comparison data
+	        const compareData: FileSyncCompareItem[] = directoryFiles.map((f) => ({
+	            file_path: f.path,
+	            file_hash: f.hash!,
+	            size: f.size
+	        }));
+	
+	        // Call compare endpoint to get sync plan
+	        const comparison = await compareFilesForSync(localStorage.token, id, compareData);
+	
+	        if (!comparison) {
+	            toast.error($i18n.t('Failed to compare files'));
+	            return;
+	        }
+	
+	        const { new_files, changed_files, removed_file_ids, unchanged } = comparison;
+
+	        // Build a path -> collected-file map once so per-file lookups in
+	        // the new/changed loops are O(1) instead of O(n). Also gives us
+	        // one place to detect server-planned paths the client can't
+	        // resolve — which should not happen but we guard defensively so
+	        // the sync summary can't over-report completion.
+	        const filesByPath = new Map(directoryFiles.map((f) => [f.path, f]));
+
+	        const totalToProcess = new_files.length + changed_files.length;
+	        let processedCount = 0;
+	
+	        // STEP 1: Delete removed files FIRST.
+	        // If a file was incorrectly classified as both "new" and "removed"
+	        // (due to filename matching issues), deleting first allows the
+	        // subsequent upload to succeed.
+	        // Use removeFileFromKnowledgeById (the KB-scoped /knowledge/{id}/
+	        // file/remove route). The backend endpoint now hard-deletes the
+	        // file record, storage blob, and per-file vector collection only
+	        // when no other knowledge base references the file — otherwise it
+	        // degrades to a scoped unlink, so syncing KB-A never wipes a file
+	        // that is also attached to KB-B. Global DELETE /files/{id} would
+	        // not have that safeguard.
+	        let removedSucceeded = 0;
+	        let removedFailed = 0;
+	        if (removed_file_ids.length > 0) {
+	            toast.info(
+	                $i18n.t('Removing {{count}} deleted files...', {
+	                    count: removed_file_ids.length
+	                })
+	            );
+	            for (const fileId of removed_file_ids) {
+	                try {
+	                    const res = await removeFileFromKnowledgeById(
+	                        localStorage.token,
+	                        id,
+	                        fileId
+	                    );
+	                    if (res) {
+	                        removedSucceeded++;
+	                    } else {
+	                        // API wrapper returned null without throwing — treat
+	                        // as a silent failure so the user isn't told we
+	                        // removed something we didn't.
+	                        removedFailed++;
+	                    }
+	                } catch (removeErr) {
+	                    removedFailed++;
+	                    console.error('Delete failed for', fileId, removeErr);
+	                    const detail =
+	                        typeof removeErr === 'string'
+	                            ? removeErr
+	                            : (removeErr?.detail ?? removeErr?.message ?? 'unknown error');
+	                    toast.error(
+	                        $i18n.t('Failed to remove file: {{detail}}', { detail })
+	                    );
+	                }
+	            }
+	        }
+
+	        // STEP 2: Upload new files. uploadFileHandler swallows per-file
+	        // errors via toasts and returns a boolean; track successes so the
+	        // final summary doesn't over-report completion when uploads fail.
+	        let newSucceeded = 0;
+	        let newFailed = 0;
+	        for (const filePath of new_files) {
+	            const fileData = filesByPath.get(filePath);
+	            if (!fileData) {
+	                // Server planned a new-file upload for a path we can't
+	                // map back to a collected file. Count as a failure and
+	                // surface it so the sync summary and the user both see
+	                // that the file wasn't actually uploaded.
+	                newFailed++;
+	                console.error('Sync: could not resolve planned new file path', filePath);
+	                toast.error(
+	                    $i18n.t('Failed to upload {{path}}: file not found in scanned directory', {
+	                        path: filePath
+	                    })
+	                );
+	                processedCount++;
+	                continue;
+	            }
+	            const ok = await uploadFileHandler(fileData.file);
+	            if (ok) {
+	                newSucceeded++;
+	            } else {
+	                newFailed++;
+	            }
+	            processedCount++;
+	            toast.info(
+	                $i18n.t('Uploading new: {{current}}/{{total}}', {
+	                    current: processedCount,
+	                    total: totalToProcess
+	                })
+	            );
+	        }
+
+	        // STEP 3: Upload changed files using atomic upload_and_replace
+	        // endpoint. The API wrapper throws on failure, so catch per file
+	        // to keep the sync going and report an accurate changed/failed
+	        // split at the end.
+	        let changedSucceeded = 0;
+	        let changedFailed = 0;
+	        for (const changedFile of changed_files) {
+	            const fileData = filesByPath.get(changedFile.file_path);
+	            if (!fileData) {
+	                // Same defensive guard as the new-files loop above.
+	                changedFailed++;
+	                console.error(
+	                    'Sync: could not resolve planned replace path',
+	                    changedFile.file_path
+	                );
+	                toast.error(
+	                    $i18n.t('Failed to update {{path}}: file not found in scanned directory', {
+	                        path: changedFile.file_path
+	                    })
+	                );
+	                processedCount++;
+	                continue;
+	            }
+	            try {
+	                await uploadAndReplaceFile(
+	                    localStorage.token,
+	                    id,
+	                    fileData.file,
+	                    changedFile.old_file_id
+	                );
+	                changedSucceeded++;
+	            } catch (replaceErr) {
+	                changedFailed++;
+	                console.error('Replace failed for', changedFile.file_path, replaceErr);
+	                const detail =
+	                    typeof replaceErr === 'string'
+	                        ? replaceErr
+	                        : (replaceErr?.detail ?? replaceErr?.message ?? 'unknown error');
+	                toast.error(
+	                    $i18n.t('Failed to update {{path}}: {{detail}}', {
+	                        path: changedFile.file_path,
+	                        detail
+	                    })
+	                );
+	            }
+	            processedCount++;
+	            toast.info(
+	                $i18n.t('Updating: {{current}}/{{total}}', {
+	                    current: processedCount,
+	                    total: totalToProcess
+	                })
+	            );
+	        }
+
+	        // Show summary. Use succeeded counts — not the planned counts —
+	        // so the user sees real outcomes. Include a failure tally only
+	        // when something went wrong.
+	        const totalFailed = newFailed + changedFailed + removedFailed;
+	        if (totalFailed > 0) {
+	            toast.warning(
+	                $i18n.t(
+	                    'Sync finished with issues: {{newCount}} new, {{changedCount}} updated, {{removedCount}} removed, {{unchangedCount}} unchanged, {{failedCount}} failed',
+	                    {
+	                        newCount: newSucceeded,
+	                        changedCount: changedSucceeded,
+	                        removedCount: removedSucceeded,
+	                        unchangedCount: unchanged.length,
+	                        failedCount: totalFailed
+	                    }
+	                )
+	            );
+	        } else {
+	            toast.success(
+	                $i18n.t(
+	                    'Sync complete: {{newCount}} new, {{changedCount}} updated, {{removedCount}} removed, {{unchangedCount}} unchanged',
+	                    {
+	                        newCount: newSucceeded,
+	                        changedCount: changedSucceeded,
+	                        removedCount: removedSucceeded,
+	                        unchangedCount: unchanged.length
+	                    }
+	                )
+	            );
+	        }
+	
+	        // Refresh the file list
+	        await init();
+	    } catch (error) {
+	        console.error('Sync error:', error);
+	        const message =
+	            typeof error === 'string'
+	                ? error
+	                : (error?.detail ?? error?.message ?? $i18n.t('Failed to sync directory'));
+	        toast.error(message);
+	    }
 	};
 
+	// Returns a truthy value only when the file actually made it into the KB,
+	// so upstream flows (uploadFileHandler → directory sync) can distinguish
+	// real successes from add failures this handler otherwise absorbs via
+	// toasts.
 	const addFileHandler = async (fileId) => {
 		const res = await addFileToKnowledgeById(localStorage.token, id, fileId).catch((e) => {
 			toast.error(`${e}`);
@@ -539,9 +848,11 @@
 		if (res) {
 			toast.success($i18n.t('File added successfully.'));
 			init();
+			return res;
 		} else {
 			toast.error($i18n.t('Failed to add file.'));
 			fileItems = fileItems.filter((file) => file.id !== fileId);
+			return null;
 		}
 	};
 
@@ -784,7 +1095,7 @@
 <SyncConfirmDialog
 	bind:show={showSyncConfirmModal}
 	message={$i18n.t(
-		'This will reset the knowledge base and sync all files. Do you wish to continue?'
+		'This will sync the knowledge base with the selected directory. New and changed files will be uploaded, and files removed from the directory will be deleted from the knowledge base. Continue?'
 	)}
 	on:confirm={() => {
 		syncDirectoryHandler();
